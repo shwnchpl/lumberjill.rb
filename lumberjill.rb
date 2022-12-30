@@ -1,7 +1,9 @@
 #!/usr/bin/env ruby
 
+require 'fileutils'
 require 'securerandom'
 require 'telegram/bot'
+require 'yaml/store'
 
 # TODO: Figure out some kind of authentication timeout?
 
@@ -13,31 +15,16 @@ require 'telegram/bot'
 require_relative 'secrets.rb'
 
 # FIXME: Read from config!
-$chat_state = {}
 $max_failed_auths = 3
-#$maul_pipe = ""
-$maul_pipe = "/tmp/maul.fifo"
-
-class ChatState
-  # FIXME: Store *all* of this persistently, somehow.
-
-  attr_reader :auth_token, :id
-  attr_accessor :authed, :tree_name, :auth_attempts, :admin_auth_sent
-
-  def initialize(id)
-    @authed = false
-    @auth_attempts = 0
-    @admin_auth_sent = false
-    @id = id
-    @tree_name = id.to_s
-    @auth_token = SecureRandom.urlsafe_base64
-  end
-end
+$maul_pipe = ""
+#$maul_pipe = "/tmp/maul.fifo"
+$cache_dir = File.join(Dir.home, ".cache", "lumberjill")
 
 class BotController
-  def initialize(bot, bot_user)
+  def initialize(bot, bot_user, state)
     @bot = bot
     @bot_user = bot_user
+    @state = state
   end
 
   def dispatch(msg)
@@ -57,13 +44,16 @@ class BotController
     chat_id = msg.chat.id
     member = msg.new_chat_member
 
-    if member.user.id == @bot_user.id
-      if member.status == "left"
-        $chat_state.delete chat_id
-      elsif member.status == "member" && $chat_state[chat_id].nil?
-        cs = ChatState.new chat_id
-        $chat_state[chat_id] = cs
-        send_auth_request(msg, cs)
+    # FIXME: Make this transaction a bit smaller?
+    @state.transaction do
+      if member.user.id == @bot_user.id
+        if member.status == "left"
+          @state.delete chat_id
+        elsif member.status == "member" && @state[chat_id].nil?
+          cs = ChatState::initial chat_id
+          @state[chat_id] = cs
+          send_auth_request(msg, cs)
+        end
       end
     end
   end
@@ -75,25 +65,28 @@ class BotController
 
     chat_id = msg.chat.id
 
-    if !msg.text.nil?
-      cs = $chat_state[chat_id]
+    # FIXME: Make this transaction smaller.
+    @state.transaction do
+      if !msg.text.nil?
+        cs = @state[chat_id]
 
-      if cs == nil
-        # XXX: This shouldn't really every happen since state is
-        # persistent. On the off chance it does, we probably *do* want
-        # to start the authentication process unless the message we've
-        # received is one notifying that we're no longer in the chat.
-        # Those messages don't seem to have a text component, so this
-        # should be safe.
-        cs = ChatState.new chat_id
-        $chat_state[chat_id] = cs
-        send_auth_request(msg, cs)
-      elsif !cs.authed
-        attempt_auth(msg, cs)
-      else
-        escaped_text = msg.text.gsub(/\n/, "\\n") + "\n"
-        handle_command(msg, cs, escaped_text) ||
-          emit_text(cs, "log", escaped_text)
+        if cs == nil
+          # XXX: This shouldn't really every happen since state is
+          # persistent. On the off chance it does, we probably *do* want
+          # to start the authentication process unless the message we've
+          # received is one notifying that we're no longer in the chat.
+          # Those messages don't seem to have a text component, so this
+          # should be safe.
+          cs = ChatState::initial chat_id
+          @state[chat_id] = cs
+          send_auth_request(msg, cs)
+        elsif !cs[:authed]
+          attempt_auth(msg, cs)
+        else
+          escaped_text = msg.text.gsub(/\n/, "\\n") + "\n"
+          handle_command(msg, cs, escaped_text) ||
+            emit_text(cs, "log", escaped_text)
+        end
       end
     end
   end
@@ -113,7 +106,7 @@ class BotController
       emit_text(cs, "timeout", timeout)
       chat_send(cs, "Timeout updated to #{timeout} seconds.", msg)
     in ["set_tree_name", name] unless name.nil? || name == ""
-      cs.tree_name = name.gsub(/:/, "_")
+      cs[:tree_name] = name.gsub(/:/, "_")
       chat_send(cs, "Tree name updated to \"#{name}\".", msg)
     in ["commit",]
       emit_text(cs, "commit", "")
@@ -128,15 +121,15 @@ class BotController
   end
 
   def attempt_auth(msg, cs)
-    if cs.auth_token != msg.text
-      cs.auth_attempts += 1
+    if cs[:auth_token] != msg.text
+      cs[:auth_attempts] += 1
 
-      if cs.auth_attempts >= $max_failed_auths
+      if cs[:auth_attempts] >= $max_failed_auths
         chat_send(cs, "Too many auth attempts. Leaving the group.", msg)
 
         begin
-          @bot.api.leave_chat(chat_id: cs.id)
-          $chat_state.delete cs.id
+          @bot.api.leave_chat(chat_id: cs[:id])
+          @state.delete cs[:id]
         rescue Telegram::Bot::Exceptions::ResponseError
           # FIXME: Handle error from this?
         end
@@ -144,12 +137,12 @@ class BotController
         send_auth_request(msg, cs)
       end
     else
-      cs.authed = true
+      cs[:authed] = true
 
       text = <<~END
         Successfully authenticated!
 
-        Tree name defaults to chat id: "#{cs.tree_name}"
+        Tree name defaults to chat id: "#{cs[:tree_name]}"
 
         To change this, please use the /set_tree_name command.
       END
@@ -160,7 +153,7 @@ class BotController
 
   def chat_send(cs, text, msg=nil)
     @bot.api.send_message(
-      chat_id: cs.id,
+      chat_id: cs[:id],
       text: text,
       reply_to_message_id: (msg.message_id if msg.respond_to? :message_id),
       allow_sending_without_reply: true
@@ -171,16 +164,16 @@ class BotController
   end
 
   def send_auth_request(msg, cs)
-    if !cs.admin_auth_sent
+    if !cs[:admin_auth_sent]
       begin
         text = <<~END
-            New auth request.
-            Chat name: #{msg.chat.title}
-            Token: #{cs.auth_token}
+          New auth request.
+          Chat name: #{msg.chat.title}
+          Token: #{cs[:auth_token]}
         END
 
         @bot.api.send_message(chat_id: $admin_chat_id, text: text)
-        cs.admin_auth_sent = true
+        cs[:admin_auth_sent] = true
       rescue Telegram::Bot::Exceptions::ResponseError
         # FIXME: Actually handle this correctly.
         STDERR.puts "Message send failed! Response error!"
@@ -196,18 +189,40 @@ class BotController
       # glue script fifo-tee.sh or some similar middleware is necessary.
       # This is because the fifo must be opened, written, and closed
       # before maul.rb will process an entry.
-      STDOUT.puts "#{command}:#{cs.tree_name}:#{text}"
+      STDOUT.puts "#{command}:#{cs[:tree_name]}:#{text}"
       STDOUT.flush
     else
       File.open($maul_pipe, "w") do |f|
-        f.write "#{command}:#{cs.tree_name}:#{text}"
+        f.write "#{command}:#{cs[:tree_name]}:#{text}"
         f.flush
       end
     end
   end
 end
 
+module ChatState
+  def self.initial(id)
+    {
+      :admin_auth_sent => false,
+      :auth_attempts => 0,
+      :auth_token => SecureRandom.urlsafe_base64,
+      :authed => false,
+      :id => id,
+      :tree_name => id.to_s,
+    }
+  end
+
+  def self.load(path)
+    FileUtils.mkdir_p(path)
+    state_path = File.join(path, "state.yaml")
+
+    YAML::Store.new state_path
+  end
+end
+
 def main
+  state = ChatState::load $cache_dir
+
   Telegram::Bot::Client.run($token) do |bot|
     response = bot.api.get_me
 
@@ -246,7 +261,7 @@ def main
       scope: Telegram::Bot::Types::BotCommandScopeAllGroupChats.new()
     )
 
-    controller = BotController.new(bot, bot_user)
+    controller = BotController.new(bot, bot_user, state)
 
     # FIXME: This can throw an exception if the server gives us a
     # 502 error, which seems to sometimes happen. It's not great to
