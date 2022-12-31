@@ -1,0 +1,6 @@
+[Unit]
+Description=Auto-commit service.
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c "/usr/local/bin/auto-commit.sh /var/telegram-logs"

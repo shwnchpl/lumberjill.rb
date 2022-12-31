@@ -1,0 +1,9 @@
+[Unit]
+Description=Auto-commit timer.
+
+[Timer]
+OnUnitActiveSec=15m
+OnBootSec=15m
+
+[Install]
+WantedBy=timers.target

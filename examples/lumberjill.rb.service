@@ -1,0 +1,9 @@
+[Unit]
+Description=Simple lumberjill.rb service.
+After=maul.rb.service
+
+[Service]
+ExecStart=/usr/local/bin/lumberjill.rb
+
+[Install]
+WantedBy=default.target

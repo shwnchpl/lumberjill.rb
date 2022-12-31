@@ -1,0 +1,8 @@
+[Unit]
+Description=Simple maul.rb service.
+
+[Service]
+ExecStart=/usr/local/bin/maul.rb
+
+[Install]
+WantedBy=default.target
